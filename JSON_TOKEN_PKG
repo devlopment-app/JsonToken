@@ -1,0 +1,196 @@
+CREATE OR REPLACE PACKAGE JSON_TOKEN_PKG AS
+  /* Create a new JSON token with given username and claims */
+  FUNCTION CREATE_TOKEN(
+    p_username IN VARCHAR2,
+    p_claims IN VARCHAR2
+  ) RETURN VARCHAR2;
+  
+  /* Validate if a token is valid */
+  FUNCTION IS_VALID(
+    p_token IN VARCHAR2
+  ) RETURN BOOLEAN;
+  
+  /* Get claims from a token as comma-separated string */
+  FUNCTION GET_CLAIMS(
+    p_token IN VARCHAR2
+  ) RETURN VARCHAR2;
+  
+  /* Check if token has specific claim */
+  FUNCTION HAS_CLAIM(
+    p_token IN VARCHAR2,
+    p_claim IN VARCHAR2
+  ) RETURN BOOLEAN;
+END JSON_TOKEN_PKG;
+/
+
+CREATE OR REPLACE PACKAGE BODY JSON_TOKEN_PKG AS
+  -- Constants
+  c_secret CONSTANT VARCHAR2(100) := 'your-secret-key-here';
+  
+  -- Private Functions
+  FUNCTION base64_encode(p_input IN VARCHAR2) RETURN VARCHAR2 IS
+    l_blob BLOB;
+    l_result VARCHAR2(32767);
+  BEGIN
+    l_blob := UTL_RAW.CAST_TO_RAW(p_input);
+    l_result := UTL_RAW.CAST_TO_VARCHAR2(UTL_ENCODE.BASE64_ENCODE(l_blob));
+    RETURN REPLACE(REPLACE(l_result, CHR(13)||CHR(10)), '=');
+  END;
+  
+  FUNCTION base64_decode(p_input IN VARCHAR2) RETURN VARCHAR2 IS
+    l_blob BLOB;
+    l_result VARCHAR2(32767);
+  BEGIN
+    l_blob := UTL_ENCODE.BASE64_DECODE(UTL_RAW.CAST_TO_RAW(p_input));
+    l_result := UTL_RAW.CAST_TO_VARCHAR2(l_blob);
+    RETURN l_result;
+  END;
+  
+  -- Split string function to replace APEX_UTIL.STRING_TO_TABLE
+  TYPE t_string_table IS TABLE OF VARCHAR2(32767);
+  
+  FUNCTION split_string(
+    p_string IN VARCHAR2,
+    p_delimiter IN VARCHAR2 DEFAULT ','
+  ) RETURN t_string_table IS
+    l_string VARCHAR2(32767) := p_string;
+    l_delimiter VARCHAR2(10) := p_delimiter;
+    l_pos NUMBER;
+    l_result t_string_table := t_string_table();
+  BEGIN
+    WHILE LENGTH(l_string) > 0 LOOP
+      l_pos := INSTR(l_string, l_delimiter);
+      IF l_pos = 0 THEN
+        l_result.EXTEND;
+        l_result(l_result.COUNT) := l_string;
+        EXIT;
+      END IF;
+      l_result.EXTEND;
+      l_result(l_result.COUNT) := SUBSTR(l_string, 1, l_pos - 1);
+      l_string := SUBSTR(l_string, l_pos + LENGTH(l_delimiter));
+    END LOOP;
+    RETURN l_result;
+  END;
+  
+  -- Public Functions Implementation
+  FUNCTION CREATE_TOKEN(
+    p_username IN VARCHAR2,
+    p_claims IN VARCHAR2
+  ) RETURN VARCHAR2 IS
+    l_header VARCHAR2(32767);
+    l_payload VARCHAR2(32767);
+    l_signature VARCHAR2(32767);
+    l_token VARCHAR2(32767);
+  BEGIN
+    -- Create header
+    l_header := '{"alg":"HS256","typ":"JWT"}';
+    
+    -- Create payload
+    l_payload := '{' ||
+      '"username":"' || p_username || '",' ||
+      '"claims":"' || p_claims || '",' ||
+      '"exp":' || TO_CHAR(UNIX_TIMESTAMP + 3600) || -- 1 hour expiration
+    '}';
+    
+    -- Encode header and payload
+    l_header := base64_encode(l_header);
+    l_payload := base64_encode(l_payload);
+    
+    -- Create signature
+    l_signature := base64_encode(
+      DBMS_CRYPTO.MAC(
+        UTL_RAW.CAST_TO_RAW(l_header || '.' || l_payload),
+        DBMS_CRYPTO.HMAC_SH256,
+        UTL_RAW.CAST_TO_RAW(c_secret)
+      )
+    );
+    
+    -- Combine all parts
+    l_token := l_header || '.' || l_payload || '.' || l_signature;
+    
+    RETURN l_token;
+  END;
+  
+  FUNCTION IS_VALID(
+    p_token IN VARCHAR2
+  ) RETURN BOOLEAN IS
+    l_parts t_string_table;
+    l_header VARCHAR2(32767);
+    l_payload VARCHAR2(32767);
+    l_signature VARCHAR2(32767);
+    l_exp NUMBER;
+    l_calculated_signature VARCHAR2(32767);
+  BEGIN
+    -- Split token
+    l_parts := split_string(p_token, '.');
+    
+    IF l_parts.COUNT != 3 THEN
+      RETURN FALSE;
+    END IF;
+    
+    l_header := l_parts(1);
+    l_payload := l_parts(2);
+    l_signature := l_parts(3);
+    
+    -- Verify signature
+    l_calculated_signature := base64_encode(
+      DBMS_CRYPTO.MAC(
+        UTL_RAW.CAST_TO_RAW(l_header || '.' || l_payload),
+        DBMS_CRYPTO.HMAC_SH256,
+        UTL_RAW.CAST_TO_RAW(c_secret)
+      )
+    );
+    
+    IF l_calculated_signature != l_signature THEN
+      RETURN FALSE;
+    END IF;
+    
+    -- Check expiration
+    l_payload := base64_decode(l_payload);
+    l_exp := TO_NUMBER(REGEXP_SUBSTR(l_payload, '"exp":(\d+)', 1, 1, NULL, 1));
+    
+    RETURN l_exp > UNIX_TIMESTAMP;
+  END;
+  
+  FUNCTION GET_CLAIMS(
+    p_token IN VARCHAR2
+  ) RETURN VARCHAR2 IS
+    l_parts t_string_table;
+    l_payload VARCHAR2(32767);
+  BEGIN
+    IF NOT IS_VALID(p_token) THEN
+      RETURN NULL;
+    END IF;
+    
+    l_parts := split_string(p_token, '.');
+    l_payload := base64_decode(l_parts(2));
+    
+    RETURN REGEXP_SUBSTR(l_payload, '"claims":"([^"]+)"', 1, 1, NULL, 1);
+  END;
+  
+  FUNCTION HAS_CLAIM(
+    p_token IN VARCHAR2,
+    p_claim IN VARCHAR2
+  ) RETURN BOOLEAN IS
+    l_claims VARCHAR2(32767);
+    l_claims_list t_string_table;
+  BEGIN
+    l_claims := GET_CLAIMS(p_token);
+    
+    IF l_claims IS NULL THEN
+      RETURN FALSE;
+    END IF;
+    
+    l_claims_list := split_string(l_claims, ',');
+    
+    FOR i IN 1..l_claims_list.COUNT LOOP
+      IF TRIM(l_claims_list(i)) = TRIM(p_claim) THEN
+        RETURN TRUE;
+      END IF;
+    END LOOP;
+    
+    RETURN FALSE;
+  END;
+  
+END JSON_TOKEN_PKG;
+/
